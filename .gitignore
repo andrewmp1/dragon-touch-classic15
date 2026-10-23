@@ -1,0 +1,28 @@
+# Local research, private calendar feeds, and drawings are never published.
+/research/
+/agenda/calendars.env*
+!/agenda/calendars.env.example
+/board/saves/
+
+# Dependencies and generated runtime/debug artifacts.
+node_modules/
+*.log
+*.png
+*.jpg
+*.jpeg
+/output/
+/screenshots/
+/diagnostics/
+/backups/
+
+# Local configuration, credentials, and editor state.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.DS_Store
+.codex/
+.agents/
+.vscode/
+.idea/

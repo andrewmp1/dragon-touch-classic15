@@ -1,0 +1,87 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { expand, merge, prefilter } from '../expand.js';
+
+const DAY = 864e5;
+const now = Date.parse('2026-10-12T12:00:00Z');
+const from = now - DAY, to = now + 14 * DAY;
+const google = readFileSync(new URL('./fixtures/google.ics', import.meta.url), 'utf8');
+const icloud = readFileSync(new URL('./fixtures/icloud.ics', import.meta.url), 'utf8');
+
+const titles = (evs, t) => evs.filter((e) => e.title === t);
+
+test('weekly recurrence honours EXDATE, moved and cancelled instances', () => {
+  const evs = expand(google, 0, from, to);
+  const soccer = titles(evs, 'Soccer practice').map((e) => e.start).sort();
+  // Mon/Wed 5 PM CDT = 22:00Z. Oct 14 is EXDATE, Oct 19 moved, Oct 21 cancelled.
+  assert.deepEqual(soccer, ['2026-10-12T22:00:00.000Z']); // Oct 26 starts after the window
+  const late = titles(evs, 'Soccer practice (late start)');
+  assert.equal(late.length, 1);
+  assert.equal(late[0].start, '2026-10-19T23:00:00.000Z');
+  assert.equal(late[0].end, '2026-10-20T00:30:00.000Z');
+  assert.equal(titles(evs, 'Soccer practice')[0].location, 'Riverside Park, Field 3');
+});
+
+test('daily event since 1995 expands only inside the window', () => {
+  const vit = titles(expand(google, 0, from, to), 'Vitamins');
+  assert.equal(vit.length, 15); // Oct 11 (ends after `from`) through Oct 25
+  assert.ok(vit.every((e) => e.start.endsWith('T12:00:00.000Z'))); // 7 AM CDT
+});
+
+test('all-day multi-day events keep plain dates, end exclusive', () => {
+  const [g] = titles(expand(google, 0, from, to), 'Grandma visiting');
+  assert.deepEqual([g.allDay, g.start, g.end], [true, '2026-10-16', '2026-10-19']);
+});
+
+test('old one-off events are dropped before parsing', () => {
+  const reduced = prefilter(google, from, to);
+  assert.ok(!reduced.includes('Old event'));
+  assert.ok(reduced.includes('BEGIN:VTIMEZONE'));
+  assert.equal(titles(expand(google, 0, from, to), 'Old event').length, 0);
+});
+
+test('iCloud feed: folded lines, TZID, floating time and all-day', () => {
+  const evs = expand(icloud, 1, from, to);
+  assert.equal(evs.find((e) => e.uid === '6A1B2C3D-BOOK-CLUB').title,
+    "Book club at a friend's with a deliberately long title so the line gets folded");
+  assert.equal(evs.find((e) => e.uid === '6A1B2C3D-BOOK-CLUB').start, '2026-10-15T23:00:00.000Z'); // 7 PM EDT
+  // Floating time uses the calendar's X-WR-TIMEZONE (New York).
+  assert.equal(titles(evs, 'Farmers market')[0].start, '2026-10-17T14:00:00.000Z');
+  assert.deepEqual(titles(evs, 'Trash pickup').map((e) => [e.start, e.end]), [['2026-10-20', '2026-10-21']]);
+});
+
+test('merge sorts both calendars and drops the shared invite duplicate', () => {
+  const evs = merge([expand(google, 0, from, to), expand(icloud, 1, from, to)]);
+  assert.equal(titles(evs, 'Dentist').length, 1);
+  assert.deepEqual(new Set(evs.map((e) => e.cal)), new Set([0, 1]));
+  const starts = evs.map((e) => Date.parse(e.start));
+  assert.deepEqual(starts, [...starts].sort((a, b) => a - b));
+  assert.ok(!('startMs' in evs[0]));
+});
+
+test('DST change keeps wall-clock time', () => {
+  const nov = Date.parse('2026-10-30T00:00:00Z');
+  const vit = titles(expand(google, 0, nov, nov + 5 * DAY), 'Vitamins').map((e) => e.start);
+  assert.ok(vit.includes('2026-10-31T12:00:00.000Z')); // CDT
+  assert.ok(vit.includes('2026-11-02T13:00:00.000Z')); // CST
+});
+
+test('fast-forwarded monthly and yearly rules match a full walk', () => {
+  const feed = (rule) => `BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:r\r\nSUMMARY:R\r\nDTSTART;TZID=America/Chicago:20030115T090000\r\nDTEND;TZID=America/Chicago:20030115T100000\r\nRRULE:${rule}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n`;
+  for (const [rule, expected] of [
+    ['FREQ=MONTHLY', ['2026-10-15T14:00:00.000Z']],
+    ['FREQ=MONTHLY;INTERVAL=5', ['2026-10-15T14:00:00.000Z']], // Oct 2026 is 285 = 5 × 57 months on
+    ['FREQ=MONTHLY;INTERVAL=7', []], // 285 isn't a multiple of 7
+    ['FREQ=MONTHLY;INTERVAL=3', ['2026-10-15T14:00:00.000Z']],
+    ['FREQ=MONTHLY;BYDAY=2TU', ['2026-10-13T14:00:00.000Z']],
+    ['FREQ=YEARLY;BYMONTH=10;BYMONTHDAY=20', ['2026-10-20T14:00:00.000Z']],
+    ['FREQ=WEEKLY;INTERVAL=2;BYDAY=TH', ['2026-10-22T14:00:00.000Z']],
+  ]) {
+    // COUNT disables fast-forward, so the same rule with a huge COUNT is the reference walk.
+    const full = expand(feed(rule + ';COUNT=100000'), 0, from, to).map((e) => e.start);
+    const fast = expand(feed(rule), 0, from, to).map((e) => e.start);
+    assert.deepEqual(fast, full, rule);
+    assert.deepEqual(fast, expected, rule);
+  }
+});

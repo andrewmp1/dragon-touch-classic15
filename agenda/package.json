@@ -1,0 +1,16 @@
+{
+  "name": "classic15-agenda",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node serve.js",
+    "test": "node --test test/*.js"
+  },
+  "dependencies": {
+    "ical.js": "2.2.1"
+  }
+}

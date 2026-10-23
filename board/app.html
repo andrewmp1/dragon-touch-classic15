@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Whiteboard</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; margin: 0; overflow: hidden; }
+  #c { position: fixed; left: 0; top: 0; background: #fdfbf6; touch-action: none; }
+  #bar {
+    position: fixed; left: 0; bottom: 0; width: 100%;
+    font-family: sans-serif;
+    display: table; table-layout: fixed; border-collapse: collapse;
+  }
+  #bar button {
+    display: table-cell; width: 16%; height: 64px;
+    border: 0; border-top: 1px solid #c9c2b4; background: #efe9dd; color: #2a241c;
+    font-size: 22px; font-family: sans-serif;
+  }
+  #bar button.on { background: #e8a04a; color: #1a120c; font-weight: bold; }
+  #bar button:disabled { color: #b3aa9b; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="bar">
+  <button id="b-ink">Ink</button>
+  <button id="b-wipe">Erase</button>
+  <button id="b-undo">Undo</button>
+  <button id="b-redo">Redo</button>
+  <button id="b-clear">Clear</button>
+  <button id="b-save">Save</button>
+</div>
+<script>
+(function () {
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var BG = '#fdfbf6', INK = '#1a120c';
+  var drawing = false, current = null, erase = false;
+
+  // Vector history: every op is a stroke {erase, pts:[[x,y],...]} or a {clear:true}.
+  // Undo pops ops and repaints; redo re-applies popped ops.
+  var ops = [], redoStack = [];
+
+  function drawStroke(op) {
+    var pts = op.pts, i;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    if (pts.length === 1) ctx.lineTo(pts[0][0] + 0.1, pts[0][1] + 0.1);
+    for (i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.stroke();
+  }
+  function paint() {
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    for (var i = 0; i < ops.length; i++) {
+      if (ops[i].clear) {
+        ctx.fillStyle = BG;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      } else {
+        ctx.strokeStyle = ops[i].erase ? BG : INK;
+        ctx.lineWidth = ops[i].erase ? 48 : 6;
+        drawStroke(ops[i]);
+      }
+    }
+  }
+  function refresh() {
+    document.getElementById('b-undo').disabled = ops.length === 0;
+    document.getElementById('b-redo').disabled = redoStack.length === 0;
+  }
+
+  // Size the canvas once, from the stable dimensions. Assigning width/height
+  // clears the bitmap, and KitKat's browser changes the viewport when its URL
+  // bar hides on scroll, which would keep wiping drawings — so repaint only
+  // when the size truly changed, and never during drawing.
+  var W0 = window.innerWidth || 768;
+  var H0 = window.innerHeight || 1366;
+  canvas.width = W0;
+  canvas.height = H0;
+  window.addEventListener('resize', function () {
+    var w = window.innerWidth || W0;
+    var h = window.innerHeight || H0;
+    if (w === canvas.width && h === canvas.height) return;
+    if (drawing) return;               // never wipe mid-stroke
+    canvas.width = w;
+    canvas.height = h;
+    paint();							// repaint what is left
+  });
+
+  function pt(e) {
+    var t = e.touches ? e.touches[0] : e;
+    return [t.clientX, t.clientY];
+  }
+  function down(e) {
+    e.preventDefault();
+    drawing = true;
+    redoStack = [];
+    current = { erase: erase, pts: [pt(e)] };
+    paintLive();
+  }
+  function move(e) {
+    if (!drawing) return;
+    e.preventDefault();
+    current.pts.push(pt(e));
+    paintLive();
+  }
+  function paintLive() {
+    var last = current.pts.length - 1;
+    if (last === 0) {
+      ctx.strokeStyle = current.erase ? BG : INK;
+      ctx.lineWidth = current.erase ? 48 : 6;
+      drawStroke({ erase: current.erase, pts: [current.pts[0]] });
+    } else {
+      ctx.strokeStyle = current.erase ? BG : INK;
+      ctx.lineWidth = current.erase ? 48 : 6;
+      drawStroke({ erase: current.erase, pts: current.pts.slice(-2) });
+    }
+  }
+  function up() {
+    if (!drawing) return;
+    drawing = false;
+    ops.push(current);
+    current = null;
+    refresh();
+  }
+
+  canvas.addEventListener('touchstart', down, false);
+  canvas.addEventListener('touchmove', move, false);
+  canvas.addEventListener('touchend', up, false);
+  canvas.addEventListener('touchcancel', up, false);
+  canvas.addEventListener('mousedown', down, false);
+  canvas.addEventListener('mousemove', move, false);
+  window.addEventListener('mouseup', up, false);
+  refresh();
+
+  var bWipe = document.getElementById('b-wipe');
+  var bInk = document.getElementById('b-ink');
+  function setErase(v) {
+    erase = v;
+    bWipe.className = v ? 'on' : '';
+    bInk.className = v ? '' : 'on';
+  }
+  setErase(false);
+  bInk.addEventListener('click', function () { setErase(false); });
+  bWipe.addEventListener('click', function () { setErase(true); });
+
+  document.getElementById('b-undo').addEventListener('click', function () {
+    if (ops.length === 0 || drawing) return;
+    redoStack.push(ops.pop());
+    paint();
+    refresh();
+  });
+  document.getElementById('b-redo').addEventListener('click', function () {
+    if (redoStack.length === 0) return;
+    ops.push(redoStack.pop());
+    paint();
+    refresh();
+  });
+  document.getElementById('b-clear').addEventListener('click', function () {
+    if (drawing) return;
+    ops.push({ clear: true });
+    redoStack = [];
+    paint();
+    refresh();
+  });
+
+  function pngBytes(data) {
+    var bin = atob(data.split(',')[1]);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+  var blankPng = (function () {
+    var clean = document.createElement('canvas');
+    clean.width = canvas.width || 1;
+    clean.height = canvas.height || 1;
+    var cctx = clean.getContext('2d');
+    cctx.fillStyle = BG;
+    cctx.fillRect(0, 0, clean.width, clean.height);
+    return clean.toDataURL('image/png');
+  })();
+  var lastSaved = blankPng;
+
+  function sendSave(auto) {
+    var data = canvas.toDataURL('image/png');
+    if (auto) {
+      if (data === lastSaved) return;
+      lastSaved = data;
+    }
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', auto ? '/save?auto=1' : '/save', true);
+    xhr.send(pngBytes(data));
+  }
+  window.setInterval(function () {
+    if (!drawing && ops.length > 0) sendSave(true);
+  }, 30000);
+  document.getElementById('b-save').addEventListener('click', function () {
+    if (!drawing) sendSave(false);
+  });
+})();
+</script>
+</body>
+</html>

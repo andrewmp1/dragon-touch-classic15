@@ -1,0 +1,7 @@
+{
+  "name": "classic15-whiteboard",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": { "start": "node serve.js" }
+}

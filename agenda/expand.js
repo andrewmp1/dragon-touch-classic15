@@ -1,0 +1,209 @@
+// Expand iCal feeds into events inside a time window.
+// Adapted from huntsyea/kitchen-frame dashboard/worker/calendar.js (MIT).
+// Copyright (c) 2026 huntsyea
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+import ICAL from 'ical.js';
+
+const DAY = 864e5;
+const MAX_OCCURRENCES = 20000; // per recurring event; a daily event from 1990 is ~13,000
+
+// A Google feed holds every event ever made. Drop one-off events outside the window with a
+// cheap string scan before parsing. Recurring events and their exceptions are always kept.
+export function prefilter(text, from, to) {
+  text = text.replace(/\r?\n[ \t]/g, ''); // unfold continuation lines
+  const lo = ymd(from - 2 * DAY), hi = ymd(to + 2 * DAY);
+  const out = ['BEGIN:VCALENDAR'];
+  const calTz = /\nX-WR-TIMEZONE:([^\r\n]+)/.exec(text);
+  if (calTz) out.push('X-WR-TIMEZONE:' + calTz[1]);
+  for (const tz of text.match(/BEGIN:VTIMEZONE[\s\S]*?END:VTIMEZONE/g) || []) out.push(tz);
+  let i = 0;
+  while ((i = text.indexOf('BEGIN:VEVENT', i)) !== -1) {
+    const end = text.indexOf('END:VEVENT', i);
+    if (end === -1) break;
+    const ev = text.slice(i, end + 10);
+    i = end + 10;
+    if (/\n(RRULE|RDATE|RECURRENCE-ID)[;:]/.test(ev) || /\nDURATION[;:]/.test(ev)) { out.push(ev); continue; }
+    const s = /\nDTSTART[^:\r\n]*:(\d{8})/.exec(ev);
+    if (!s) continue;
+    const e = /\nDTEND[^:\r\n]*:(\d{8})/.exec(ev);
+    if ((e ? e[1] : s[1]) >= lo && s[1] <= hi) out.push(ev);
+  }
+  out.push('END:VCALENDAR');
+  return out.join('\r\n');
+}
+
+// Expand one feed into events overlapping [from, to). `fallbackTz` covers floating times.
+export function expand(text, cal, from, to, fallbackTz = 'UTC') {
+  const root = new ICAL.Component(ICAL.parse(prefilter(text, from, to)));
+  for (const tz of root.getAllSubcomponents('vtimezone')) ICAL.TimezoneService.register(tz);
+  const calTz = root.getFirstPropertyValue('x-wr-timezone');
+  const tzFor = (comp, prop) => comp.getFirstProperty(prop)?.getParameter('tzid') || calTz || fallbackTz;
+
+  const events = [];
+  const masters = [];
+  const overridden = new Map(); // uid -> Set of instance keys replaced by an exception
+
+  function emit(comp, uid, start, end, startTz) {
+    if (String(comp.getFirstPropertyValue('status')).toUpperCase() === 'CANCELLED') return;
+    const ev = toEvent(comp, uid, cal, start, end, startTz);
+    if (ev.endMs > from && ev.startMs < to) events.push(ev);
+  }
+
+  for (const comp of root.getAllSubcomponents('vevent')) {
+    const event = new ICAL.Event(comp);
+    const uid = event.uid || Math.random().toString(36);
+    if (comp.hasProperty('recurrence-id')) {
+      const rid = comp.getFirstPropertyValue('recurrence-id');
+      if (!overridden.has(uid)) overridden.set(uid, new Set());
+      overridden.get(uid).add(instanceKey(rid, tzFor(comp, 'recurrence-id')));
+      emit(comp, uid, event.startDate, event.endDate, tzFor(comp, 'dtstart'));
+    } else if (event.isRecurring()) {
+      masters.push(event);
+    } else {
+      emit(comp, uid, event.startDate, event.endDate, tzFor(comp, 'dtstart'));
+    }
+  }
+
+  for (const event of masters) {
+    const comp = event.component, uid = event.uid, tz = tzFor(comp, 'dtstart');
+    const skip = overridden.get(uid);
+    const dur = utcMs(event.endDate, tz) - utcMs(event.startDate, tz);
+    const it = event.iterator(fastForward(event, from - dur));
+    let occ, n = 0;
+    while ((occ = it.next()) && n++ < MAX_OCCURRENCES) {
+      const naive = Date.UTC(occ.year, occ.month - 1, occ.day, occ.hour, occ.minute, occ.second);
+      if (naive > to + DAY) break;
+      if (naive + dur < from - DAY) continue;
+      if (skip && skip.has(instanceKey(occ, tz))) continue;
+      const end = occ.clone();
+      end.addDuration(event.duration);
+      emit(comp, uid, occ, end, tz);
+    }
+  }
+  return events;
+}
+
+// Merge feeds: drop duplicates (the same invite on both calendars), sort, strip sort keys.
+export function merge(lists) {
+  const seen = new Set(), out = [];
+  for (const ev of lists.flat()) {
+    const key = ev.uid + '|' + ev.start;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(ev);
+  }
+  out.sort((a, b) => a.startMs - b.startMs || a.cal - b.cal || a.title.localeCompare(b.title));
+  return out.map(({ startMs, endMs, ...ev }) => ev);
+}
+
+// ical.js walks a rule from DTSTART, so a daily event from years ago costs thousands of steps.
+// For rules without COUNT, start the walk at the last whole interval before the window instead:
+// same phase, same weekdays, same results. Skipped when the shifted date could overflow the
+// month (day 29+) and for multiple RRULEs.
+function fastForward(event, from) {
+  const rules = event.component.getAllProperties('rrule');
+  if (rules.length !== 1) return undefined;
+  const rule = rules[0].getFirstValue(), interval = rule.interval || 1;
+  if (rule.count) return undefined;
+  const s = event.startDate, f = new Date(from - 2 * DAY);
+  const start = s.clone();
+  if (rule.freq === 'DAILY' || rule.freq === 'WEEKLY') {
+    const stepDays = (rule.freq === 'DAILY' ? 1 : 7) * interval;
+    const steps = Math.floor((f - Date.UTC(s.year, s.month - 1, s.day)) / (stepDays * DAY));
+    if (steps <= 0) return undefined;
+    start.adjust(steps * stepDays, 0, 0, 0);
+  } else if (rule.freq === 'MONTHLY' || rule.freq === 'YEARLY') {
+    if (s.day > 28) return undefined;
+    const unit = rule.freq === 'MONTHLY' ? interval : 12 * interval;
+    const months = (f.getUTCFullYear() - s.year) * 12 + f.getUTCMonth() - (s.month - 1) - 1;
+    const steps = Math.floor(months / unit);
+    if (steps <= 0) return undefined;
+    const total = s.year * 12 + s.month - 1 + steps * unit;
+    start.year = Math.floor(total / 12);
+    start.month = (total % 12) + 1;
+  } else {
+    return undefined;
+  }
+  return start;
+}
+
+function toEvent(comp, uid, cal, start, end, tz) {
+  const allDay = start.isDate;
+  const startMs = utcMs(start, tz), endMs = Math.max(utcMs(end, tz), startMs);
+  const location = comp.getFirstPropertyValue('location');
+  return {
+    uid, cal, startMs, endMs, allDay,
+    title: String(comp.getFirstPropertyValue('summary') || '(No title)'),
+    // All-day events stay as plain dates (end exclusive) so the frame shows them on its own day.
+    start: allDay ? dateStr(start) : new Date(startMs).toISOString(),
+    end: allDay ? dateStr(end) : new Date(endMs).toISOString(),
+    ...(location ? { location: String(location) } : {}),
+  };
+}
+
+function instanceKey(t, tz) {
+  return t.isDate ? dateStr(t) : utcMs(t, tz);
+}
+
+// ICAL.Time -> epoch ms. Uses Intl for IANA zones (current DST rules), the feed's VTIMEZONE for
+// anything else, and `tz` (TZID, X-WR-TIMEZONE or fallback) for floating times.
+function utcMs(t, tz) {
+  if (t.isDate) return Date.UTC(t.year, t.month - 1, t.day);
+  const zone = t.zone?.tzid;
+  if (zone === 'UTC' || zone === 'Z') return Date.UTC(t.year, t.month - 1, t.day, t.hour, t.minute, t.second);
+  const name = zone && zone !== 'floating' ? zone : tz;
+  if (isIana(name)) return zonedToUtc(t, name);
+  if (t.zone && t.zone !== ICAL.Timezone.localTimezone) return t.toUnixTime() * 1000;
+  return zonedToUtc(t, isIana(tz) ? tz : 'UTC');
+}
+
+const formats = new Map();
+function fmt(tz) {
+  if (!formats.has(tz)) {
+    formats.set(tz, new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, hourCycle: 'h23',
+      year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric',
+    }));
+  }
+  return formats.get(tz);
+}
+function isIana(tz) {
+  if (!tz) return false;
+  try { fmt(tz); return true; } catch { formats.delete(tz); return false; }
+}
+function offset(ms, tz) {
+  const p = {};
+  for (const { type, value } of fmt(tz).formatToParts(new Date(ms))) p[type] = +value;
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - Math.floor(ms / 1000) * 1000;
+}
+function zonedToUtc(t, tz) {
+  const wall = Date.UTC(t.year, t.month - 1, t.day, t.hour, t.minute, t.second);
+  const first = wall - offset(wall, tz);
+  const second = wall - offset(first, tz);
+  return second;
+}
+
+function dateStr(t) {
+  return new Date(Date.UTC(t.year, t.month - 1, t.day)).toISOString().slice(0, 10);
+}
+function ymd(ms) {
+  return new Date(ms).toISOString().slice(0, 10).replace(/-/g, '');
+}
